@@ -25,7 +25,7 @@ from .modeling_utils import PreTrainedModel
 from .optimization import AdamW, get_linear_schedule_with_warmup
 from .trainer_utils import PREFIX_CHECKPOINT_DIR, EvalPrediction, PredictionOutput, TrainOutput, set_seed
 from .training_args import TrainingArguments
-
+from .loss import CosineEmbeddingMSELoss, CosineEmbeddingBCELoss, CircleLoss, NegativeCircleLoss
 
 _use_native_amp = False
 _use_apex = False
@@ -166,6 +166,7 @@ class Trainer:
     def __init__(
         self,
         model: PreTrainedModel,
+        model_b: PreTrainedModel,
         args: TrainingArguments,
         data_collator: Optional[DataCollator] = None,
         train_dataset: Optional[Dataset] = None,
@@ -176,6 +177,7 @@ class Trainer:
         **kwargs,
     ):
         self.model = model.to(args.device)
+        self.model_b = model_b.to(args.device)
         self.args = args
         self.data_collator = data_collator if data_collator is not None else default_data_collator
         self.train_dataset = train_dataset
@@ -465,19 +467,28 @@ class Trainer:
             self.lr_scheduler.load_state_dict(torch.load(os.path.join(model_path, "scheduler.pt")))
 
         model = self.model
+        model_b = self.model_b
         if self.args.fp16 and _use_apex:
             if not is_apex_available():
                 raise ImportError("Please install apex from https://www.github.com/nvidia/apex to use fp16 training.")
             model, self.optimizer = amp.initialize(model, self.optimizer, opt_level=self.args.fp16_opt_level)
+            model_b, self.optimizer = amp.initialize(model_b, self.optimizer, opt_level=self.args.fp16_opt_level)
 
         # multi-gpu training (should be after apex fp16 initialization)
         if self.args.n_gpu > 1:
             model = torch.nn.DataParallel(model)
+            model_b = torch.nn.DataParallel(model_b)
 
         # Distributed training (should be after apex fp16 initialization)
         if self.args.local_rank != -1:
             model = torch.nn.parallel.DistributedDataParallel(
                 model,
+                device_ids=[self.args.local_rank],
+                output_device=self.args.local_rank,
+                find_unused_parameters=True,
+            )
+            model_b = torch.nn.parallel.DistributedDataParallel(
+                model_b,
                 device_ids=[self.args.local_rank],
                 output_device=self.args.local_rank,
                 find_unused_parameters=True,
@@ -496,7 +507,7 @@ class Trainer:
                 * self.args.gradient_accumulation_steps
                 * (torch.distributed.get_world_size() if self.args.local_rank != -1 else 1)
             )
-        logger.info("***** Running training *****")
+        logger.info("***** Running deep-recall dssm training *****")
         logger.info("  Num examples = %d", self.num_examples(train_dataloader))
         logger.info("  Num Epochs = %d", num_train_epochs)
         logger.info("  Instantaneous batch size per device = %d", self.args.per_device_train_batch_size)
@@ -529,6 +540,7 @@ class Trainer:
         tr_loss = 0.0
         logging_loss = 0.0
         model.zero_grad()
+        model_b.zero_grad()
         train_iterator = trange(
             epochs_trained, int(num_train_epochs), desc="Epoch", disable=not self.is_local_process_zero()
         )
@@ -555,7 +567,7 @@ class Trainer:
                     steps_trained_in_current_epoch -= 1
                     continue
 
-                tr_loss += self.training_step(model, inputs)
+                tr_loss += self.training_step(model, model_b, inputs)
 
                 if (step + 1) % self.args.gradient_accumulation_steps == 0 or (
                     # last step in epoch but step is always smaller than gradient_accumulation_steps
@@ -759,6 +771,68 @@ class Trainer:
 
         if self.args.past_index >= 0:
             self._past = outputs[self.args.past_index]
+
+        if self.args.n_gpu > 1:
+            loss = loss.mean()  # mean() to average on multi-gpu parallel training
+
+        if self.args.gradient_accumulation_steps > 1:
+            loss = loss / self.args.gradient_accumulation_steps
+
+        if self.args.fp16 and _use_native_amp:
+            self.scaler.scale(loss).backward()
+        elif self.args.fp16 and _use_apex:
+            with amp.scale_loss(loss, self.optimizer) as scaled_loss:
+                scaled_loss.backward()
+        else:
+            loss.backward()
+
+        return loss.item()
+
+    def training_step(self, model: nn.Module, model_b: nn.Module, inputs: Dict[str, Union[torch.Tensor, Any]]) -> float:
+        """
+        Perform a training step on a batch of inputs.
+
+        Subclass and override to inject custom behavior.
+
+        Args:
+            model (:obj:`nn.Module`):
+                The model to train.
+            inputs (:obj:`Dict[str, Union[torch.Tensor, Any]]`):
+                The inputs and targets of the model.
+
+                The dictionary will be unpacked before being fed to the model. Most models expect the targets under the
+                argument :obj:`labels`. Check your model's documentation for all accepted arguments.
+
+        Return:
+            :obj:`float`: The training loss on this batch.
+        """
+        if hasattr(self, "_training_step"):
+            warnings.warn(
+                "The `_training_step` method is deprecated and won't be called in a future version, define `training_step` in your subclass.",
+                FutureWarning,
+            )
+            return self._training_step(model, inputs, self.optimizer)
+
+        model.train()
+        model_b.train()
+        inputs = self._prepare_inputs(inputs, model)
+        inputs_b = self._prepare_inputs(inputs, model_b)
+
+        loss_fct_circle = CircleLoss(m=args.circle_loss_m, gamma=args.circle_loss_gamma)
+        if self.args.fp16 and _use_native_amp:
+            with autocast():
+                outputs = model(**inputs)
+                outputs_b = model(**inputs_b)
+                loss = loss_fct_circle(outputs, outputs_b)
+        else:
+            outputs = model(**inputs)
+            outputs_b = model(**inputs_b)
+            # We don't use .loss here since the model may return tuples instead of ModelOutput.
+            loss = loss_fct_circle(logits_a, logits_b)
+        logger.info("outputs: {0}".format(outputs))
+        logger.info("loss: {0}".format(loss))
+        if self.args.past_index >= 0:
+            self._past = outputs_b[self.args.past_index]
 
         if self.args.n_gpu > 1:
             loss = loss.mean()  # mean() to average on multi-gpu parallel training
