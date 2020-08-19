@@ -16,6 +16,7 @@
 """ Finetuning the library models for sequence classification on GLUE (Bert, XLM, XLNet, RoBERTa, Albert, XLM-RoBERTa)."""
 
 
+
 import dataclasses
 import logging
 import os
@@ -25,7 +26,7 @@ from typing import Callable, Dict, Optional
 
 import numpy as np
 
-from transformers import AutoConfig, AutoModelForSequenceClassification, AutoTokenizer, EvalPrediction, GlueDataset
+from transformers import AutoConfig, AutoModelForSequenceEmbedding, AutoTokenizer, EvalPrediction, GlueDataset
 from transformers import GlueDataTrainingArguments as DataTrainingArguments
 from transformers import (
     HfArgumentParser,
@@ -58,6 +59,18 @@ class ModelArguments:
     )
     cache_dir: Optional[str] = field(
         default=None, metadata={"help": "Where do you want to store the pretrained models downloaded from s3"}
+    )
+    circle_loss_m: float = field(
+        default=0.25,
+        metadata={
+            "help": "circle_loss_m "
+        },
+    )
+    circle_loss_gamma: float = field(
+        default=2,
+        metadata={
+            "help": "circle_loss_gamma "
+        },
     )
 
 
@@ -136,13 +149,13 @@ def main():
         model_args.tokenizer_name if model_args.tokenizer_name else model_args.model_name_or_path,
         cache_dir=model_args.cache_dir,
     )
-    model_a = AutoModelForSequenceClassification.from_pretrained(
+    model_a = AutoModelForSequenceEmbedding.from_pretrained(
         model_args.model_name_or_path,
         from_tf=bool(".ckpt" in model_args.model_name_or_path),
         config=config_a,
         cache_dir=model_args.cache_dir,
     )
-    model_b = AutoModelForSequenceClassification.from_pretrained(
+    model_b = AutoModelForSequenceEmbedding.from_pretrained(
         model_args.model_name_or_path,
         from_tf=bool(".ckpt" in model_args.model_name_or_path),
         config=config_b,
@@ -193,7 +206,7 @@ def main():
         # For convenience, we also re-save the tokenizer to the same directory,
         # so that you can share your model easily on huggingface.co/models =)
         if trainer.is_world_master():
-            tokenizer.save_pretrained(training_args.output_dir)
+            tokenizer_a.save_pretrained(training_args.output_dir)
 
     # Evaluation
     eval_results = {}
@@ -205,7 +218,7 @@ def main():
         if data_args.task_name == "mnli":
             mnli_mm_data_args = dataclasses.replace(data_args, task_name="mnli-mm")
             eval_datasets.append(
-                GlueDataset(mnli_mm_data_args, tokenizer=tokenizer, mode="dev", cache_dir=model_args.cache_dir)
+                GlueDataset(mnli_mm_data_args, tokenizer=tokenizer_a, mode="dev", cache_dir=model_args.cache_dir)
             )
 
         for eval_dataset in eval_datasets:
@@ -230,7 +243,7 @@ def main():
         if data_args.task_name == "mnli":
             mnli_mm_data_args = dataclasses.replace(data_args, task_name="mnli-mm")
             test_datasets.append(
-                GlueDataset(mnli_mm_data_args, tokenizer=tokenizer, mode="test", cache_dir=model_args.cache_dir)
+                GlueDataset(mnli_mm_data_args, tokenizer=tokenizer_a, mode="test", cache_dir=model_args.cache_dir)
             )
 
         for test_dataset in test_datasets:

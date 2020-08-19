@@ -818,7 +818,8 @@ class Trainer:
         inputs = self._prepare_inputs(inputs, model)
         inputs_b = self._prepare_inputs(inputs, model_b)
 
-        loss_fct_circle = CircleLoss(m=args.circle_loss_m, gamma=args.circle_loss_gamma)
+        # loss_fct_circle = CircleLoss(m=self.args.circle_loss_m, gamma=self.args.circle_loss_gamma)
+        loss_fct_circle = CircleLoss(m=0.25, gamma=2)
         if self.args.fp16 and _use_native_amp:
             with autocast():
                 outputs = model(**inputs)
@@ -828,7 +829,7 @@ class Trainer:
             outputs = model(**inputs)
             outputs_b = model(**inputs_b)
             # We don't use .loss here since the model may return tuples instead of ModelOutput.
-            loss = loss_fct_circle(logits_a, logits_b)
+            loss = loss_fct_circle(outputs, outputs_b)
         logger.info("outputs: {0}".format(outputs))
         logger.info("loss: {0}".format(loss))
         if self.args.past_index >= 0:

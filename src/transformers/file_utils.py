@@ -316,6 +316,22 @@ PT_SEQUENCE_CLASSIFICATION_SAMPLE = r"""
         >>> logits = outputs.logits
 """
 
+PT_SEQUENCE_EMBEDDING_SAMPLE = r"""
+    Example::
+
+        >>> from transformers import {tokenizer_class}, {model_class}
+        >>> import torch
+
+        >>> tokenizer = {tokenizer_class}.from_pretrained('{checkpoint}')
+        >>> model = {model_class}.from_pretrained('{checkpoint}', return_dict=True)
+
+        >>> inputs = tokenizer("Hello, my dog is cute", return_tensors="pt")
+        >>> labels = torch.tensor([1]).unsqueeze(0)  # Batch size 1
+        >>> outputs = model(**inputs, labels=labels)
+        >>> loss = outputs.loss
+        >>> logits = outputs.logits
+"""
+
 PT_MASKED_LM_SAMPLE = r"""
     Example::
 
@@ -434,6 +450,22 @@ TF_SEQUENCE_CLASSIFICATION_SAMPLE = r"""
         >>> loss, logits = outputs[:2]
 """
 
+TF_SEQUENCE_EMBEDDING_SAMPLE = r"""
+    Example::
+
+        >>> from transformers import {tokenizer_class}, {model_class}
+        >>> import tensorflow as tf
+
+        >>> tokenizer = {tokenizer_class}.from_pretrained('{checkpoint}')
+        >>> model = {model_class}.from_pretrained('{checkpoint}')
+
+        >>> inputs = tokenizer("Hello, my dog is cute", return_tensors="tf")
+        >>> inputs["labels"] = tf.reshape(tf.constant(1), (-1, 1)) # Batch size 1
+
+        >>> outputs = model(inputs)
+        >>> loss, logits = outputs[:2]
+"""
+
 TF_MASKED_LM_SAMPLE = r"""
     Example::
         >>> from transformers import {tokenizer_class}, {model_class}
@@ -506,6 +538,8 @@ def add_code_sample_docstrings(*docstr, tokenizer_class=None, checkpoint=None, o
 
         if "SequenceClassification" in model_class:
             code_sample = TF_SEQUENCE_CLASSIFICATION_SAMPLE if is_tf_class else PT_SEQUENCE_CLASSIFICATION_SAMPLE
+        elif "SequenceEmbedding" in model_class:
+            code_sample = TF_SEQUENCE_EMBEDDING_SAMPLE if is_tf_class else PT_SEQUENCE_EMBEDDING_SAMPLE
         elif "QuestionAnswering" in model_class:
             code_sample = TF_QUESTION_ANSWERING_SAMPLE if is_tf_class else PT_QUESTION_ANSWERING_SAMPLE
         elif "TokenClassification" in model_class:
