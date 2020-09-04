@@ -25,7 +25,7 @@ from .modeling_utils import PreTrainedModel
 from .optimization import AdamW, get_linear_schedule_with_warmup
 from .trainer_utils import PREFIX_CHECKPOINT_DIR, EvalPrediction, PredictionOutput, TrainOutput, set_seed
 from .training_args import TrainingArguments
-from .loss import CosineEmbeddingMSELoss, CosineEmbeddingBCELoss, CircleLoss, NegativeCircleLoss
+from .loss import CosineEmbeddingMSELoss, CosineEmbeddingBCELoss, CosineEmbeddingBCELossWithNegtive, CosineEmbeddingBCELossWithWeightedNegtive, CosineEmbeddingBCELossSumWithWeightedNegtive, TripletLoss, TripletHardLoss, CircleLoss, NegativeCircleLoss, loss_function_map
 
 _use_native_amp = False
 _use_apex = False
@@ -561,13 +561,33 @@ class Trainer:
                 self._past = None
 
             for step, inputs in enumerate(epoch_iterator):
-
+                # logger.info("*** enumerate steps ***")
+                # logger.info("step: %d", step)
                 # Skip past any already trained steps if resuming training
                 if steps_trained_in_current_epoch > 0:
                     steps_trained_in_current_epoch -= 1
                     continue
+                inputs_a = {}
+                inputs_b = {}
+                inputs_c = {}
+                inputs_d = {}
 
-                tr_loss += self.training_step(model, model_b, inputs)
+                for k,v in inputs.items():
+                    
+                    if k.endswith("_b"):
+                        inputs_b[k[:-2]] = v
+                    elif k.endswith("_c"):
+                        inputs_c[k[:-2]] = v
+                    elif k.endswith("_d"):
+                        inputs_d[k[:-2]] = v
+                    else:
+                        inputs_a[k] = v
+                # logger.info("inputs_a: %s", inputs_a)
+                # logger.info("inputs_b: %s", inputs_b)
+                if(bool(inputs_c)):
+                    tr_loss += self.training_step(model, model_b, inputs_a, inputs_b, inputs_c, inputs_d)
+                else:
+                    tr_loss += self.training_step(model, model_b, inputs_a, inputs_b)
 
                 if (step + 1) % self.args.gradient_accumulation_steps == 0 or (
                     # last step in epoch but step is always smaller than gradient_accumulation_steps
@@ -592,6 +612,7 @@ class Trainer:
 
                     self.lr_scheduler.step()
                     model.zero_grad()
+                    model_b.zero_grad()
                     self.global_step += 1
                     self.epoch = epoch + (step + 1) / len(epoch_iterator)
 
@@ -625,7 +646,7 @@ class Trainer:
                         # Save model checkpoint
                         output_dir = os.path.join(self.args.output_dir, f"{PREFIX_CHECKPOINT_DIR}-{self.global_step}")
 
-                        self.save_model(output_dir)
+                        self.save_dssm_model(output_dir)
 
                         if self.is_world_process_zero():
                             self._rotate_checkpoints()
@@ -634,9 +655,13 @@ class Trainer:
                             xm.rendezvous("saving_optimizer_states")
                             xm.save(self.optimizer.state_dict(), os.path.join(output_dir, "optimizer.pt"))
                             xm.save(self.lr_scheduler.state_dict(), os.path.join(output_dir, "scheduler.pt"))
+                            xm.save(self.optimizer.state_dict(), os.path.join(output_dir+"-b", "optimizer.pt"))
+                            xm.save(self.lr_scheduler.state_dict(), os.path.join(output_dir+"-b", "scheduler.pt"))
                         elif self.is_world_process_zero():
                             torch.save(self.optimizer.state_dict(), os.path.join(output_dir, "optimizer.pt"))
                             torch.save(self.lr_scheduler.state_dict(), os.path.join(output_dir, "scheduler.pt"))
+                            torch.save(self.optimizer.state_dict(), os.path.join(output_dir+"-b", "optimizer.pt"))
+                            torch.save(self.lr_scheduler.state_dict(), os.path.join(output_dir+"-b", "scheduler.pt"))
 
                 if self.args.max_steps > 0 and self.global_step > self.args.max_steps:
                     epoch_iterator.close()
@@ -850,6 +875,116 @@ class Trainer:
             loss.backward()
 
         return loss.item()
+    
+    def training_step(self,
+         model: nn.Module, 
+         model_b: nn.Module, 
+         inputs: Dict[str, Union[torch.Tensor, Any]], 
+         inputs_b: Dict[str, Union[torch.Tensor, Any]],
+         inputs_c: Optional[Dict[str, Union[torch.Tensor, Any]]]=None,
+         inputs_d: Optional[Dict[str, Union[torch.Tensor, Any]]]=None
+         ) -> float:
+        """
+        Perform a training step on a batch of inputs.
+
+        Subclass and override to inject custom behavior.
+
+        Args:
+            model (:obj:`nn.Module`):
+                The model to train.
+            inputs (:obj:`Dict[str, Union[torch.Tensor, Any]]`):
+                The inputs and targets of the model.
+
+                The dictionary will be unpacked before being fed to the model. Most models expect the targets under the
+                argument :obj:`labels`. Check your model's documentation for all accepted arguments.
+
+        Return:
+            :obj:`float`: The training loss on this batch.
+        """
+        if hasattr(self, "_training_step"):
+            warnings.warn(
+                "The `_training_step` method is deprecated and won't be called in a future version, define `training_step` in your subclass.",
+                FutureWarning,
+            )
+            return self._training_step(model, inputs, self.optimizer)
+
+        model.train()
+        model_b.train()
+        inputs = self._prepare_inputs(inputs, model)
+        inputs_b = self._prepare_inputs(inputs_b, model_b)
+        if bool(inputs_c):
+            inputs_c = self._prepare_inputs(inputs_c, model_b)
+        if bool(inputs_d):
+            inputs_d = self._prepare_inputs(inputs_d, model_b)    
+        labels = inputs["labels"]
+        # logger.info("labels: {0}".format(labels))
+
+        # loss_fct_circle = CircleLoss(m=self.args.circle_loss_m, gamma=self.args.circle_loss_gamma)
+        loss_fct_circle = CircleLoss(m=0.25, gamma=2)
+        if self.args.loss_function == "bce":
+            loss_fct = CosineEmbeddingBCELoss()
+        elif self.args.loss_function == "bcewithneg":
+            loss_fct = CosineEmbeddingBCELossWithNegtive()
+        elif self.args.loss_function == "bcewithnegweight":
+            loss_fct = CosineEmbeddingBCELossWithWeightedNegtive(neg_weight=self.args.train_batch_size)
+        elif self.args.loss_function == "bcewithsumnegweight":
+            loss_fct = CosineEmbeddingBCELossSumWithWeightedNegtive()
+        elif self.args.loss_function == "triplet":
+            loss_fct = TripletLoss()
+        elif self.args.loss_function == "triplet_hard":
+            loss_fct = TripletHardLoss()
+
+        
+        # loss_fct = loss_function_map[self.args.loss_function]
+        # loss_fct = loss_function_map["bcewithneg"]
+        if self.args.fp16 and _use_native_amp:
+            with autocast():
+                outputs = model(**inputs)
+                outputs_b = model_b(**inputs_b)
+                # loss = loss_fct_circle(outputs, outputs_b)
+                if self.args.loss_function == "triplet":
+                    loss = loss_fct(outputs, outputs_b)
+                else:
+                    logits, loss = loss_fct(outputs, outputs_b, labels)
+        else:
+            outputs = model(**inputs)
+            outputs_b = model_b(**inputs_b)
+
+            
+            # We don't use .loss here since the model may return tuples instead of ModelOutput.
+            # loss = loss_fct_circle(outputs, outputs_b)
+            if self.args.loss_function == "triplet":
+                loss = loss_fct(outputs, outputs_b)
+            elif self.args.loss_function == "triplet_hard":
+                outputs_c = model_b(**inputs_c)
+                outputs_d = model_b(**inputs_d)
+                loss = loss_fct(outputs, outputs_b, outputs_c, outputs_d)
+            else:
+                logits, loss = loss_fct(outputs, outputs_b, labels)
+            
+        # torch.set_printoptions(profile="full") # print full tensor content
+        logger.info("-------outputs: {0}".format(outputs))
+        logger.info("-------outputs_b: {0}".format(outputs_b))
+        logger.info("-------labels: {0}".format(labels))
+        logger.info("-------loss: {0}".format(loss))
+        if self.args.past_index >= 0:
+            self._past = outputs_b[self.args.past_index]
+
+        if self.args.n_gpu > 1:
+            loss = loss.mean()  # mean() to average on multi-gpu parallel training
+
+        if self.args.gradient_accumulation_steps > 1:
+            loss = loss / self.args.gradient_accumulation_steps
+
+        if self.args.fp16 and _use_native_amp:
+            self.scaler.scale(loss).backward()
+        elif self.args.fp16 and _use_apex:
+            with amp.scale_loss(loss, self.optimizer) as scaled_loss:
+                scaled_loss.backward()
+        else:
+            loss.backward()
+
+        return loss.item()
 
     def is_local_master(self) -> bool:
         """
@@ -906,7 +1041,19 @@ class Trainer:
             self._save_tpu(output_dir)
         elif self.is_world_process_zero():
             self._save(output_dir)
+    
+    def save_dssm_model(self, output_dir: Optional[str] = None):
+        """
+        Will save the model, so you can reload it using :obj:`from_pretrained()`.
 
+        Will only save from the world_master process (unless in TPUs).
+        """
+
+        if is_torch_tpu_available():
+            self._save_tpu(output_dir)
+        elif self.is_world_process_zero():
+            self._save_dssm(output_dir)
+    
     def _save_tpu(self, output_dir: Optional[str] = None):
         output_dir = output_dir if output_dir is not None else self.args.output_dir
         logger.info("Saving model checkpoint to %s", output_dir)
@@ -935,6 +1082,32 @@ class Trainer:
 
         # Good practice: save your training arguments together with the trained model
         torch.save(self.args, os.path.join(output_dir, "training_args.bin"))
+
+    def _save_dssm(self, output_dir: Optional[str] = None):
+        output_dir_a = output_dir if output_dir is not None else self.args.output_dir
+        os.makedirs(output_dir_a, exist_ok=True)
+        logger.info("Saving model checkpoint to %s", output_dir_a)
+        # Save a trained model and configuration using `save_pretrained()`.
+        # They can then be reloaded using `from_pretrained()`
+        if not isinstance(self.model, PreTrainedModel):
+            raise ValueError("Trainer.model appears to not be a PreTrainedModel")
+        self.model.save_pretrained(output_dir_a)
+
+        # Good practice: save your training arguments together with the trained model
+        torch.save(self.args, os.path.join(output_dir, "training_args.bin"))
+
+        output_dir_b = output_dir if output_dir is not None else self.args.output_dir
+        output_dir_b = output_dir_b + "-b"
+        os.makedirs(output_dir_b, exist_ok=True)
+        logger.info("Saving model checkpoint to %s", output_dir_b)
+        # Save a trained model and configuration using `save_pretrained()`.
+        # They can then be reloaded using `from_pretrained()`
+        if not isinstance(self.model, PreTrainedModel):
+            raise ValueError("Trainer.model appears to not be a PreTrainedModel")
+        self.model_b.save_pretrained(output_dir_b)
+
+        # Good practice: save your training arguments together with the trained model
+        torch.save(self.args, os.path.join(output_dir_b, "training_args.bin"))
 
     def _sorted_checkpoints(self, checkpoint_prefix=PREFIX_CHECKPOINT_DIR, use_mtime=False) -> List[str]:
         ordering_and_checkpoint_path = []

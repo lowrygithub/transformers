@@ -26,7 +26,7 @@ from typing import Callable, Dict, Optional
 
 import numpy as np
 
-from transformers import AutoConfig, AutoModelForSequenceEmbedding, AutoTokenizer, EvalPrediction, GlueDataset
+from transformers import AutoConfig, AutoModelForSequenceEmbedding, AutoTokenizer, EvalPrediction, GlueDataset, DssmDataset, DssmDatasetDisk, DssmDatasetDiskForRanking
 from transformers import GlueDataTrainingArguments as DataTrainingArguments
 from transformers import (
     HfArgumentParser,
@@ -161,21 +161,40 @@ def main():
         config=config_b,
         cache_dir=model_args.cache_dir,
     )
-
     # Get datasets
-    train_dataset = (
-        GlueDataset(data_args, tokenizer=tokenizer_a, cache_dir=model_args.cache_dir) if training_args.do_train else None
-    )
+
+    if training_args.loss_function == "triplet_hard":
+        train_dataset = (
+            DssmDatasetDiskForRanking(data_args, tokenizer=tokenizer_a, tokenizer_b=tokenizer_b, cache_dir=model_args.cache_dir) if training_args.do_train else None
+        )
+    else:
+        train_dataset = (
+            DssmDatasetDisk(data_args, tokenizer=tokenizer_a, tokenizer_b=tokenizer_b, cache_dir=model_args.cache_dir) if training_args.do_train else None
+        )
     eval_dataset = (
-        GlueDataset(data_args, tokenizer=tokenizer_a, mode="dev", cache_dir=model_args.cache_dir)
+        DssmDataset(data_args, tokenizer=tokenizer_a, tokenizer_b=tokenizer_b, mode="dev", cache_dir=model_args.cache_dir)
         if training_args.do_eval
         else None
     )
     test_dataset = (
-        GlueDataset(data_args, tokenizer=tokenizer_a, mode="test", cache_dir=model_args.cache_dir)
+        DssmDataset(data_args, tokenizer=tokenizer_a, tokenizer_b=tokenizer_b, mode="test", cache_dir=model_args.cache_dir)
         if training_args.do_predict
         else None
     )
+    # # Get datasets
+    # train_dataset = (
+    #     GlueDataset(data_args, tokenizer=tokenizer_a, cache_dir=model_args.cache_dir) if training_args.do_train else None
+    # )
+    # eval_dataset = (
+    #     GlueDataset(data_args, tokenizer=tokenizer_a, mode="dev", cache_dir=model_args.cache_dir)
+    #     if training_args.do_eval
+    #     else None
+    # )
+    # test_dataset = (
+    #     GlueDataset(data_args, tokenizer=tokenizer_a, mode="test", cache_dir=model_args.cache_dir)
+    #     if training_args.do_predict
+    #     else None
+    # )
 
     def build_compute_metrics_fn(task_name: str) -> Callable[[EvalPrediction], Dict]:
         def compute_metrics_fn(p: EvalPrediction):

@@ -113,6 +113,9 @@ class TrainingArguments:
             at the next training step under the keyword argument ``mems``.
         run_name (:obj:`str`, `optional`):
             A descriptor for the run. Notably used for wandb logging.
+        loss_function (:obj:'str', 'optional'):
+            loss function type
+
     """
 
     output_dir: str = field(
@@ -231,6 +234,10 @@ class TrainingArguments:
 
     run_name: Optional[str] = field(
         default=None, metadata={"help": "An optional descriptor for the run. Notably used for wandb logging."}
+    )
+
+    loss_function: Optional[str] = field(
+        default="bce", metadata={"help": "loss function type, could be one of bce, bcewithneg or circle."}
     )
 
     @property

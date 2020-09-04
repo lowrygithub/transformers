@@ -449,6 +449,9 @@ if is_torch_available():
     )
     from .data.datasets import (
         GlueDataset,
+        DssmDataset,
+        DssmDatasetDisk,
+        DssmDatasetDiskForRanking,
         TextDataset,
         LineByLineTextDataset,
         GlueDataTrainingArguments,
