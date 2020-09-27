@@ -17,6 +17,7 @@
 
 
 
+
 import dataclasses
 import logging
 import os
@@ -49,6 +50,9 @@ class ModelArguments:
     """
 
     model_name_or_path: str = field(
+        metadata={"help": "Path to pretrained model or model identifier from huggingface.co/models"}
+    )
+    model_name_or_path_b: str = field(
         metadata={"help": "Path to pretrained model or model identifier from huggingface.co/models"}
     )
     config_name: Optional[str] = field(
@@ -136,7 +140,7 @@ def main():
         cache_dir=model_args.cache_dir,
     )
     config_b = AutoConfig.from_pretrained(
-        model_args.config_name if model_args.config_name else model_args.model_name_or_path,
+        model_args.config_name if model_args.config_name else model_args.model_name_or_path_b,
         num_labels=num_labels,
         finetuning_task=data_args.task_name,
         cache_dir=model_args.cache_dir,
@@ -146,7 +150,7 @@ def main():
         cache_dir=model_args.cache_dir,
     )
     tokenizer_b = AutoTokenizer.from_pretrained(
-        model_args.tokenizer_name if model_args.tokenizer_name else model_args.model_name_or_path,
+        model_args.tokenizer_name if model_args.tokenizer_name else model_args.model_name_or_path_b,
         cache_dir=model_args.cache_dir,
     )
     model_a = AutoModelForSequenceEmbedding.from_pretrained(
@@ -156,8 +160,8 @@ def main():
         cache_dir=model_args.cache_dir,
     )
     model_b = AutoModelForSequenceEmbedding.from_pretrained(
-        model_args.model_name_or_path,
-        from_tf=bool(".ckpt" in model_args.model_name_or_path),
+        model_args.model_name_or_path_b,
+        from_tf=bool(".ckpt" in model_args.model_name_or_path_b),
         config=config_b,
         cache_dir=model_args.cache_dir,
     )
@@ -171,11 +175,28 @@ def main():
         train_dataset = (
             DssmDatasetDisk(data_args, tokenizer=tokenizer_a, tokenizer_b=tokenizer_b, cache_dir=model_args.cache_dir) if training_args.do_train else None
         )
-    eval_dataset = (
-        DssmDataset(data_args, tokenizer=tokenizer_a, tokenizer_b=tokenizer_b, mode="dev", cache_dir=model_args.cache_dir)
+    
+    eval_dataset_a = (
+        DssmDataset(data_args, tokenizer=tokenizer_a, tokenizer_b=tokenizer_b, mode="dev_a", cache_dir=model_args.cache_dir)
         if training_args.do_eval
         else None
     )
+    # print("eval_dataset_a.guids:", eval_dataset_a.guids[:10])
+
+    eval_dataset_b = (
+        DssmDataset(data_args, tokenizer=tokenizer_a, tokenizer_b=tokenizer_b, mode="dev_b", cache_dir=model_args.cache_dir)
+        if training_args.do_eval
+        else None
+    )
+    # print("eval_dataset_b.guids:", eval_dataset_b.guids[:10])
+
+    eval_dataset_label = (
+        DssmDataset(data_args, tokenizer=tokenizer_a, tokenizer_b=tokenizer_b, mode="dev_label", cache_dir=model_args.cache_dir)
+        if training_args.do_eval
+        else None
+    )
+    # print("eval_dataset_label.guids:", eval_dataset_label.guids[:10])
+
     test_dataset = (
         DssmDataset(data_args, tokenizer=tokenizer_a, tokenizer_b=tokenizer_b, mode="test", cache_dir=model_args.cache_dir)
         if training_args.do_predict
@@ -212,7 +233,10 @@ def main():
         model_b=model_b,
         args=training_args,
         train_dataset=train_dataset,
-        eval_dataset=eval_dataset,
+        eval_dataset=None,
+        eval_dataset_label=eval_dataset_label,
+        eval_dataset_a=eval_dataset_a,
+        eval_dataset_b=eval_dataset_b,
         compute_metrics=build_compute_metrics_fn(data_args.task_name),
     )
 
@@ -228,33 +252,32 @@ def main():
             tokenizer_a.save_pretrained(training_args.output_dir)
 
     # Evaluation
-    eval_results = {}
+    
     if training_args.do_eval:
         logger.info("*** Evaluate ***")
 
         # Loop to handle MNLI double evaluation (matched, mis-matched)
-        eval_datasets = [eval_dataset]
-        if data_args.task_name == "mnli":
-            mnli_mm_data_args = dataclasses.replace(data_args, task_name="mnli-mm")
-            eval_datasets.append(
-                GlueDataset(mnli_mm_data_args, tokenizer=tokenizer_a, mode="dev", cache_dir=model_args.cache_dir)
-            )
+        
+        # print('eval_dataset_label:', eval_dataset_label)
+        # print('eval_dataset_a:', eval_dataset_a)
+        # print('eval_dataset_b:', eval_dataset_b)
+       
 
-        for eval_dataset in eval_datasets:
-            trainer.compute_metrics = build_compute_metrics_fn(eval_dataset.args.task_name)
-            eval_result = trainer.evaluate(eval_dataset=eval_dataset)
+        
+        trainer.compute_metrics = build_compute_metrics_fn(eval_dataset_a.args.task_name)
+        eval_result = trainer.evaluate(eval_dataset_label=eval_dataset_label, eval_dataset_a=eval_dataset_a, eval_dataset_b=eval_dataset_b)
 
-            output_eval_file = os.path.join(
-                training_args.output_dir, f"eval_results_{eval_dataset.args.task_name}.txt"
-            )
-            if trainer.is_world_master():
-                with open(output_eval_file, "w") as writer:
-                    logger.info("***** Eval results {} *****".format(eval_dataset.args.task_name))
-                    for key, value in eval_result.items():
-                        logger.info("  %s = %s", key, value)
-                        writer.write("%s = %s\n" % (key, value))
+        output_eval_file = os.path.join(
+            model_args.model_name_or_path, f"eval_results_{eval_dataset_a.args.task_name}.txt"
+        )
+        if trainer.is_world_master():
+            with open(output_eval_file, "w") as writer:
+                logger.info("***** Eval results {} *****".format(eval_dataset_a.args.task_name))
+                for key, value in eval_result.items():
+                    logger.info("  %s = %s", key, value)
+                    writer.write("%s = %s\n" % (key, value))
 
-            eval_results.update(eval_result)
+        # eval_results.update(eval_result)
 
     if training_args.do_predict:
         logging.info("*** Test ***")

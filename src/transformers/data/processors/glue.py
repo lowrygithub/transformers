@@ -100,6 +100,39 @@ def dssm_convert_examples_to_features(
         examples, tokenizer, tokenizer_b, max_length=max_length, max_length_b=max_length_b, task=task, label_list=label_list, output_mode=output_mode
     )
 
+def dssm_convert_examples_a_to_features(
+    examples: Union[List[InputExample], "tf.data.Dataset"],
+    tokenizer: PreTrainedTokenizer,
+    max_length: Optional[int] = None,
+    task=None,
+    label_list=None,
+    output_mode=None,
+):
+    """
+    Loads a data file into a list of ``InputFeatures``
+
+    Args:
+        examples: List of ``InputExamples`` or ``tf.data.Dataset`` containing the examples.
+        tokenizer: Instance of a tokenizer that will tokenize the examples
+        max_length: Maximum example length. Defaults to the tokenizer's max_len
+        task: GLUE task
+        label_list: List of labels. Can be obtained from the processor using the ``processor.get_labels()`` method
+        output_mode: String indicating the output mode. Either ``regression`` or ``classification``
+
+    Returns:
+        If the ``examples`` input is a ``tf.data.Dataset``, will return a ``tf.data.Dataset``
+        containing the task-specific features. If the input is a list of ``InputExamples``, will return
+        a list of task-specific ``InputFeatures`` which can be fed to the model.
+
+    """
+    if is_tf_available() and isinstance(examples, tf.data.Dataset):
+        if task is None:
+            raise ValueError("When calling glue_convert_examples_to_features from TF, the task parameter is required.")
+        return _tf_glue_convert_examples_to_features(examples, tokenizer, max_length=max_length, task=task)
+    return _dssm_convert_examples_a_to_features(
+        examples, tokenizer, max_length=max_length, task=task, label_list=label_list, output_mode=output_mode
+    )
+
 def dssm_convert_examples_with_neg_to_features(
     examples: Union[List[InputExampleWithNeg], "tf.data.Dataset"],
     tokenizer: PreTrainedTokenizer,
@@ -286,6 +319,62 @@ def _dssm_convert_examples_to_features(
     #     logger.info("guid: %s" % (example.guid))
     #     logger.info("features: %s" % features[i])
     return features
+
+def _dssm_convert_examples_a_to_features(
+    examples: List[InputExample],
+    tokenizer: PreTrainedTokenizer,
+    max_length: Optional[int] = None,
+    task=None,
+    label_list=None,
+    output_mode=None,
+):
+    if max_length is None:
+        max_length = tokenizer.max_len
+
+    if task is not None:
+        processor = glue_processors[task]()
+        if label_list is None:
+            label_list = processor.get_labels()
+            logger.info("Using label list %s for task %s" % (label_list, task))
+        if output_mode is None:
+            output_mode = glue_output_modes[task]
+            logger.info("Using output mode %s for task %s" % (output_mode, task))
+
+    label_map = {label: i for i, label in enumerate(label_list)}
+
+    def label_from_example(example: InputExample) -> Union[int, float, None]:
+        if example.label is None:
+            return None
+        if output_mode == "classification":
+            return label_map[example.label]
+        elif output_mode == "regression":
+            return float(example.label)
+        raise KeyError(output_mode)
+
+    labels = [label_from_example(example) for example in examples]
+    print('start tokenization')
+    batch_encoding = tokenizer(
+        [(example.text_a, "") for example in examples],
+        max_length=max_length,
+        padding="max_length",
+        truncation=True,
+    )
+    print('finish tokenization')
+    features = []
+    for i in range(len(examples)):
+        inputs = {k: batch_encoding[k][i] for k in batch_encoding}
+        # logger.info("inputs: %s" % inputs)
+
+        feature = InputFeaturesDssm(**inputs, label=labels[i])
+        features.append(feature)
+
+    for i, example in enumerate(examples[:5]):
+        logger.info("*** Example ***")
+        logger.info("guid: %s" % (example.guid))
+        logger.info("features: %s" % features[i])
+
+    return features
+
 
 def _glue_convert_examples_to_features(
     examples: List[InputExample],
@@ -493,6 +582,18 @@ class DssmProcessor(DataProcessor):
         """See base class."""
         return self._create_examples(self._read_tsv(os.path.join(data_dir, "dev.tsv")), "dev")
 
+    def get_dev_a_examples(self, data_dir):
+        """See base class."""
+        return self._create_examples_a(self._read_tsv(os.path.join(data_dir, "dev_a.tsv")), "dev_a")
+
+    def get_dev_b_examples(self, data_dir):
+        """See base class."""
+        return self._create_examples_a(self._read_tsv(os.path.join(data_dir, "dev_b_10k.tsv")), "dev_b")
+
+    def get_dev_label_examples(self, data_dir):
+        """See base class."""
+        return self._create_examples_label(self._read_tsv(os.path.join(data_dir, "dev_label.tsv")), "dev_label")
+
     def get_test_examples(self, data_dir):
         """See base class."""
         return self._create_examples(self._read_tsv(os.path.join(data_dir, "test.tsv")), "test")
@@ -520,6 +621,42 @@ class DssmProcessor(DataProcessor):
 
             label = None if set_type == "test" else line[0]
             examples.append(InputExample(guid=guid, text_a=text_a, text_b=text_b, label=label))
+        return examples
+
+    def _create_examples_a(self, lines, set_type):
+        """Creates examples for the training, dev and test sets."""
+        """
+        id_a
+        text_a
+        """
+        examples = []
+        for (i, line) in enumerate(lines):
+            if i == 0:
+                continue
+            guid = "%s-%s" % (set_type, i)
+            id_a = line[0]
+            text_a = line[1]
+
+            examples.append(InputExample(guid=id_a, text_a=text_a))
+        return examples
+
+    def _create_examples_label(self, lines, set_type):
+        """Creates examples for the training, dev and test sets."""
+        """
+        label
+        id_a
+        id_b
+        """
+        examples = []
+        for (i, line) in enumerate(lines):
+            if i == 0:
+                continue
+            label = line[0]
+            id_a = line[1]
+            id_b = line[2]
+            guid = "%s-%s" % (id_a, id_b)
+
+            examples.append(InputExample(guid=guid, text_a="", label=label))
         return examples
 
 

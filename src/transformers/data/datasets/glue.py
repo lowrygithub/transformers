@@ -15,7 +15,7 @@ from ...tokenization_bart import BartTokenizer, BartTokenizerFast
 from ...tokenization_roberta import RobertaTokenizer, RobertaTokenizerFast
 from ...tokenization_utils import PreTrainedTokenizer
 from ...tokenization_xlm_roberta import XLMRobertaTokenizer
-from ..processors.glue import glue_convert_examples_to_features, dssm_convert_examples_to_features, dssm_convert_examples_with_neg_to_features, glue_output_modes, glue_processors
+from ..processors.glue import glue_convert_examples_to_features, dssm_convert_examples_to_features, dssm_convert_examples_a_to_features, dssm_convert_examples_with_neg_to_features, glue_output_modes, glue_processors
 from ..processors.utils import InputFeatures, InputExample, InputExampleWithNeg, InputFeaturesDssm, InputFeaturesWithNegDssm
 
 
@@ -62,6 +62,9 @@ class Split(Enum):
     train = "train"
     dev = "dev"
     test = "test"
+    dev_label = "dev_label"
+    dev_a = "dev_a"
+    dev_b = "dev_b"
 
 
 class GlueDataset(Dataset):
@@ -189,15 +192,7 @@ class DssmDataset(Dataset):
             ),
         )
         label_list = self.processor.get_labels()
-        if args.task_name in ["mnli", "mnli-mm"] and tokenizer.__class__ in (
-            RobertaTokenizer,
-            RobertaTokenizerFast,
-            XLMRobertaTokenizer,
-            BartTokenizer,
-            BartTokenizerFast,
-        ):
-            # HACK(label indices are swapped in RoBERTa pretrained model)
-            label_list[1], label_list[2] = label_list[2], label_list[1]
+
         self.label_list = label_list
 
         # Make sure only the first process in distributed training processes the dataset,
@@ -216,27 +211,50 @@ class DssmDataset(Dataset):
 
                 if mode == Split.dev:
                     examples = self.processor.get_dev_examples(args.data_dir)
+                elif mode == Split.dev_label:
+                    examples = self.processor.get_dev_label_examples(args.data_dir)
+                    print('dev label example: ', examples[0])
+                elif mode == Split.dev_a:
+                    examples = self.processor.get_dev_a_examples(args.data_dir)
+                    print('dev a example: ', examples[0])
+                elif mode == Split.dev_b:
+                    examples = self.processor.get_dev_b_examples(args.data_dir)
+                    # print('dev b example: ', examples[0])
                 elif mode == Split.test:
                     examples = self.processor.get_test_examples(args.data_dir)
                 else:
                     examples = self.processor.get_train_examples(args.data_dir)
                 if limit_length is not None:
                     examples = examples[:limit_length]
-                self.features = dssm_convert_examples_to_features(
-                    examples,
-                    tokenizer,
-                    tokenizer_b,
-                    max_length=args.max_seq_length,
-                    max_length_b=args.max_seq_length,
-                    label_list=label_list,
-                    output_mode=self.output_mode,
-                )
+                self.guids = [example.guid for example in examples]
+                
+                # if mode == Split.dev_label:
+                #     pass
+                if mode == Split.dev_a or mode == Split.dev_b or mode == Split.dev_label:
+                    self.features = dssm_convert_examples_a_to_features(
+                        examples,
+                        tokenizer,
+                        max_length=args.max_seq_length,
+                        label_list=label_list,
+                        output_mode=self.output_mode,
+                    )
+                
+                else:
+                    self.features = dssm_convert_examples_to_features(
+                        examples,
+                        tokenizer,
+                        tokenizer_b,
+                        max_length=args.max_seq_length,
+                        max_length_b=args.max_seq_length,
+                        label_list=label_list,
+                        output_mode=self.output_mode,
+                    )
                 start = time.time()
-                torch.save(self.features, cached_features_file)
-                # ^ This seems to take a lot of time so I want to investigate why and how we can improve.
-                logger.info(
-                    "Saving features into cached file %s [took %.3f s]", cached_features_file, time.time() - start
-                )
+                # torch.save(self.features, cached_features_file)
+                # # ^ This seems to take a lot of time so I want to investigate why and how we can improve.
+                # logger.info(
+                #     "Saving features into cached file %s [took %.3f s]", cached_features_file, time.time() - start
+                # )
 
     def __len__(self):
         return len(self.features)
@@ -284,15 +302,6 @@ class DssmDatasetDisk(Dataset):
             ),
         )
         label_list = self.processor.get_labels()
-        if args.task_name in ["mnli", "mnli-mm"] and tokenizer.__class__ in (
-            RobertaTokenizer,
-            RobertaTokenizerFast,
-            XLMRobertaTokenizer,
-            BartTokenizer,
-            BartTokenizerFast,
-        ):
-            # HACK(label indices are swapped in RoBERTa pretrained model)
-            label_list[1], label_list[2] = label_list[2], label_list[1]
         self.label_list = label_list
 
         # Make sure only the first process in distributed training processes the dataset,
@@ -388,15 +397,6 @@ class DssmDatasetDiskForRanking(Dataset):
             ),
         )
         label_list = self.processor.get_labels()
-        if args.task_name in ["mnli", "mnli-mm"] and tokenizer.__class__ in (
-            RobertaTokenizer,
-            RobertaTokenizerFast,
-            XLMRobertaTokenizer,
-            BartTokenizer,
-            BartTokenizerFast,
-        ):
-            # HACK(label indices are swapped in RoBERTa pretrained model)
-            label_list[1], label_list[2] = label_list[2], label_list[1]
         self.label_list = label_list
 
         # Make sure only the first process in distributed training processes the dataset,

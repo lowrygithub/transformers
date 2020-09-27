@@ -29,8 +29,25 @@ def is_sklearn_available():
 
 if _has_sklearn:
 
+    def intersection(lst1, lst2): 
+        # Use of hybrid method 
+        temp = set(lst2) 
+        lst3 = [value for value in lst1 if value in temp] 
+        return lst3 
+
     def simple_accuracy(preds, labels):
         return (preds == labels).mean()
+    
+    def fidelity(preds, labels):
+        labels_excellent, labels_good = labels[0], labels[1]
+        # calculation
+        score = 0.0
+        score_ideal = 0.0
+        for docs, docs_excellent, docs_good in preds, labels_excellent, labels_good:
+            score = score + 15.0 * len(intersection(docs, docs_excellent)) + 7.0 * len(intersection(docs, docs_good))
+            score_ideal = score_ideal + 15.0 * len(docs_excellent) + 7.0 * len(docs_good)
+            
+        return score/score_ideal
 
     def acc_and_f1(preds, labels):
         acc = simple_accuracy(preds, labels)
@@ -54,6 +71,8 @@ if _has_sklearn:
         assert len(preds) == len(
             labels
         ), f"Predictions and labels have mismatched lengths {len(preds)} and {len(labels)}"
+        if task_name == "dssm":
+            return {"fidelity": fidelity(preds, labels)}
         if task_name == "cola":
             return {"mcc": matthews_corrcoef(labels, preds)}
         elif task_name == "sst-2":

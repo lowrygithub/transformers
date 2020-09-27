@@ -8,6 +8,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
+from .metrics import get_fidelity
 import numpy as np
 import torch
 from packaging import version
@@ -171,6 +172,9 @@ class Trainer:
         data_collator: Optional[DataCollator] = None,
         train_dataset: Optional[Dataset] = None,
         eval_dataset: Optional[Dataset] = None,
+        eval_dataset_label: Optional[Dataset] = None,
+        eval_dataset_a: Optional[Dataset] = None,
+        eval_dataset_b: Optional[Dataset] = None,
         compute_metrics: Optional[Callable[[EvalPrediction], Dict]] = None,
         tb_writer: Optional["SummaryWriter"] = None,
         optimizers: Tuple[torch.optim.Optimizer, torch.optim.lr_scheduler.LambdaLR] = (None, None),
@@ -182,6 +186,9 @@ class Trainer:
         self.data_collator = data_collator if data_collator is not None else default_data_collator
         self.train_dataset = train_dataset
         self.eval_dataset = eval_dataset
+        self.eval_dataset_label = eval_dataset_label
+        self.eval_dataset_a = eval_dataset_a
+        self.eval_dataset_b = eval_dataset_b
         self.compute_metrics = compute_metrics
         self.optimizer, self.lr_scheduler = optimizers
         self.tb_writer = tb_writer
@@ -848,11 +855,11 @@ class Trainer:
         if self.args.fp16 and _use_native_amp:
             with autocast():
                 outputs = model(**inputs)
-                outputs_b = model(**inputs_b)
+                outputs_b = model_b(**inputs_b)
                 loss = loss_fct_circle(outputs, outputs_b)
         else:
             outputs = model(**inputs)
-            outputs_b = model(**inputs_b)
+            outputs_b = model_b(**inputs_b)
             # We don't use .loss here since the model may return tuples instead of ModelOutput.
             loss = loss_fct_circle(outputs, outputs_b)
         logger.info("outputs: {0}".format(outputs))
@@ -963,9 +970,9 @@ class Trainer:
                 logits, loss = loss_fct(outputs, outputs_b, labels)
             
         # torch.set_printoptions(profile="full") # print full tensor content
-        logger.info("-------outputs: {0}".format(outputs))
-        logger.info("-------outputs_b: {0}".format(outputs_b))
-        logger.info("-------labels: {0}".format(labels))
+        # logger.info("-------outputs: {0}".format(outputs))
+        # logger.info("-------outputs_b: {0}".format(outputs_b))
+        # logger.info("-------labels: {0}".format(labels))
         logger.info("-------loss: {0}".format(loss))
         if self.args.past_index >= 0:
             self._past = outputs_b[self.args.past_index]
@@ -1141,7 +1148,11 @@ class Trainer:
             logger.info("Deleting older checkpoint [{}] due to args.save_total_limit".format(checkpoint))
             shutil.rmtree(checkpoint)
 
-    def evaluate(self, eval_dataset: Optional[Dataset] = None) -> Dict[str, float]:
+    def evaluate(self, 
+        eval_dataset_label: Optional[Dataset] = None,
+        eval_dataset_a: Optional[Dataset] = None,
+        eval_dataset_b: Optional[Dataset] = None
+        ) -> Dict[str, float]:
         """
         Run evaluation and returns metrics.
 
@@ -1157,17 +1168,39 @@ class Trainer:
         Returns:
             A dictionary containing the evaluation loss and the potential metrics computed from the predictions.
         """
-        eval_dataloader = self.get_eval_dataloader(eval_dataset)
+        eval_a_dataloader = self.get_eval_dataloader(eval_dataset_a)
+        eval_b_dataloader = self.get_eval_dataloader(eval_dataset_b)
+        eval_label_dataloader = self.get_eval_dataloader(eval_dataset_label)
 
-        output = self.prediction_loop(eval_dataloader, description="Evaluation")
+        a_ids, a_pred = eval_dataset_a.guids, self.prediction_loop_a(eval_a_dataloader, description="Evaluation")
+        print('a_ids:', a_ids[:10])
+        print('a_pred:', a_pred.predictions)
 
-        self.log(output.metrics)
+        b_ids, b_pred = eval_dataset_b.guids, self.prediction_loop_b(eval_b_dataloader, description="Evaluation")
+        print('b_ids:', b_ids[:10])
+        print('b_pred:', b_pred.predictions)
+
+        labels_ids, labels = eval_dataset_label.guids, self.prediction_loop_label(eval_label_dataloader, description="Evaluation")
+        print('labels_ids:', labels_ids[:10])
+        print('labels:', labels.label_ids)
+
+        fidelity = get_fidelity(a_ids, a_pred.predictions, b_ids, b_pred.predictions, labels_ids, labels.label_ids)
+        print("fidelity:", fidelity)
+        # pred = ann_search(a_pred.predictions, b_pred.predictions)
+
+        # metric = fidelity(pred, labels.label_ids)
+
+        # top 10 b_id for each a_id
+
+        # calculate fidelity
+        metrics = {'fidelity': fidelity}
+        self.log(metrics)
 
         if self.args.tpu_metrics_debug or self.args.debug:
             # tpu-comment: Logging debug metrics for PyTorch/XLA (compile, execute times, ops, etc.)
             xm.master_print(met.metrics_report())
 
-        return output.metrics
+        return metrics
 
     def predict(self, test_dataset: Dataset) -> PredictionOutput:
         """
@@ -1237,14 +1270,24 @@ class Trainer:
             self._past = None
 
         for inputs in tqdm(dataloader, desc=description):
-            loss, logits, labels = self.prediction_step(model, inputs, prediction_loss_only)
+
+            inputs_a = {}
+            inputs_b = {}
+
+            for k,v in inputs.items():
+                
+                if k.endswith("_b"):
+                    inputs_b[k[:-2]] = v
+                else:
+                    inputs_a[k] = v
+
+            logits, labels = self.prediction_step(model, inputs, prediction_loss_only)
             if loss is not None:
                 eval_losses.append(loss)
             if logits is not None:
                 preds = logits if preds is None else torch.cat((preds, logits), dim=0)
             if labels is not None:
                 label_ids = labels if label_ids is None else torch.cat((label_ids, labels), dim=0)
-
         if self.args.past_index and hasattr(self, "_past"):
             # Clean the state at the end of the evaluation loop
             delattr(self, "_past")
@@ -1282,6 +1325,261 @@ class Trainer:
 
         return PredictionOutput(predictions=preds, label_ids=label_ids, metrics=metrics)
 
+    def prediction_loop_a(
+        self, dataloader: DataLoader, description: str, prediction_loss_only: Optional[bool] = None
+    ) -> PredictionOutput:
+        """
+        Prediction/evaluation loop, shared by :obj:`Trainer.evaluate()` and :obj:`Trainer.predict()`.
+
+        Works both with or without labels.
+        """
+        
+        prediction_loss_only = (
+            prediction_loss_only if prediction_loss_only is not None else self.args.prediction_loss_only
+        )
+
+        model = self.model
+        # multi-gpu eval
+        if self.args.n_gpu > 1:
+            model = torch.nn.DataParallel(model)
+        else:
+            model = self.model
+        # Note: in torch.distributed mode, there's no point in wrapping the model
+        # inside a DistributedDataParallel as we'll be under `no_grad` anyways.
+
+        batch_size = dataloader.batch_size
+        logger.info("***** Running %s *****", description)
+        logger.info("  Num examples = %d", self.num_examples(dataloader))
+        logger.info("  Batch size = %d", batch_size)
+        eval_losses: List[float] = []
+        preds: torch.Tensor = None
+        label_ids: torch.Tensor = None
+        model.eval()
+
+        if is_torch_tpu_available():
+            dataloader = pl.ParallelLoader(dataloader, [self.args.device]).per_device_loader(self.args.device)
+
+        if self.args.past_index >= 0:
+            self._past = None
+
+        for inputs in tqdm(dataloader, desc=description):
+
+            inputs_a = {}
+            inputs_b = {}
+
+            for k,v in inputs.items():
+                
+                if k.endswith("_b"):
+                    inputs_b[k[:-2]] = v
+                else:
+                    inputs_a[k] = v
+
+            logits, _ = self.prediction_step(model, inputs_a, prediction_loss_only)
+            
+            if logits is not None:
+                preds = logits if preds is None else torch.cat((preds, logits), dim=0)
+            
+
+        if self.args.past_index and hasattr(self, "_past"):
+            # Clean the state at the end of the evaluation loop
+            delattr(self, "_past")
+
+        if self.args.local_rank != -1:
+            # In distributed mode, concatenate all results from all nodes:
+            if preds is not None:
+                preds = self.distributed_concat(preds, num_total_examples=self.num_examples(dataloader))
+            if label_ids is not None:
+                label_ids = self.distributed_concat(label_ids, num_total_examples=self.num_examples(dataloader))
+        elif is_torch_tpu_available():
+            # tpu-comment: Get all predictions and labels from all worker shards of eval dataset
+            if preds is not None:
+                preds = xm.mesh_reduce("eval_preds", preds, torch.cat)
+            if label_ids is not None:
+                label_ids = xm.mesh_reduce("eval_label_ids", label_ids, torch.cat)
+
+        # Finally, turn the aggregated tensors into numpy arrays.
+        if preds is not None:
+            preds = preds.cpu().numpy()
+
+
+        metrics = {}
+        for key in list(metrics.keys()):
+            if not key.startswith("eval_"):
+                metrics[f"eval_{key}"] = metrics.pop(key)
+
+        return PredictionOutput(predictions=preds, label_ids=label_ids, metrics=metrics)
+    def prediction_loop_b(
+        self, dataloader: DataLoader, description: str, prediction_loss_only: Optional[bool] = None
+    ) -> PredictionOutput:
+        """
+        Prediction/evaluation loop, shared by :obj:`Trainer.evaluate()` and :obj:`Trainer.predict()`.
+
+        Works both with or without labels.
+        """
+        
+        prediction_loss_only = (
+            prediction_loss_only if prediction_loss_only is not None else self.args.prediction_loss_only
+        )
+
+        model = self.model
+        # multi-gpu eval
+        if self.args.n_gpu > 1:
+            model = torch.nn.DataParallel(model_b)
+        else:
+            model = self.model_b
+        # Note: in torch.distributed mode, there's no point in wrapping the model
+        # inside a DistributedDataParallel as we'll be under `no_grad` anyways.
+
+        batch_size = dataloader.batch_size
+        logger.info("***** Running %s *****", description)
+        logger.info("  Num examples = %d", self.num_examples(dataloader))
+        logger.info("  Batch size = %d", batch_size)
+        eval_losses: List[float] = []
+        preds: torch.Tensor = None
+        label_ids: torch.Tensor = None
+        model.eval()
+
+        if is_torch_tpu_available():
+            dataloader = pl.ParallelLoader(dataloader, [self.args.device]).per_device_loader(self.args.device)
+
+        if self.args.past_index >= 0:
+            self._past = None
+
+        for inputs in tqdm(dataloader, desc=description):
+
+            inputs_a = {}
+            inputs_b = {}
+
+            for k,v in inputs.items():
+                
+                if k.endswith("_b"):
+                    inputs_b[k[:-2]] = v
+                else:
+                    inputs_a[k] = v
+
+            logits, _ = self.prediction_step(model, inputs_a, prediction_loss_only)
+            
+            if logits is not None:
+                preds = logits if preds is None else torch.cat((preds, logits), dim=0)
+            
+
+        if self.args.past_index and hasattr(self, "_past"):
+            # Clean the state at the end of the evaluation loop
+            delattr(self, "_past")
+
+        if self.args.local_rank != -1:
+            # In distributed mode, concatenate all results from all nodes:
+            if preds is not None:
+                preds = self.distributed_concat(preds, num_total_examples=self.num_examples(dataloader))
+            if label_ids is not None:
+                label_ids = self.distributed_concat(label_ids, num_total_examples=self.num_examples(dataloader))
+        elif is_torch_tpu_available():
+            # tpu-comment: Get all predictions and labels from all worker shards of eval dataset
+            if preds is not None:
+                preds = xm.mesh_reduce("eval_preds", preds, torch.cat)
+            if label_ids is not None:
+                label_ids = xm.mesh_reduce("eval_label_ids", label_ids, torch.cat)
+
+        # Finally, turn the aggregated tensors into numpy arrays.
+        if preds is not None:
+            preds = preds.cpu().numpy()
+
+
+        metrics = {}
+        for key in list(metrics.keys()):
+            if not key.startswith("eval_"):
+                metrics[f"eval_{key}"] = metrics.pop(key)
+
+        return PredictionOutput(predictions=preds, label_ids=label_ids, metrics=metrics)
+
+ 
+    def prediction_loop_label(
+        self, dataloader: DataLoader, description: str, prediction_loss_only: Optional[bool] = None
+    ) -> PredictionOutput:
+        """
+        Prediction/evaluation loop, shared by :obj:`Trainer.evaluate()` and :obj:`Trainer.predict()`.
+
+        Works both with or without labels.
+        """
+        
+        prediction_loss_only = (
+            prediction_loss_only if prediction_loss_only is not None else self.args.prediction_loss_only
+        )
+
+        model = self.model
+        # multi-gpu eval
+        if self.args.n_gpu > 1:
+            model = torch.nn.DataParallel(model_b)
+        else:
+            model = self.model_b
+        # Note: in torch.distributed mode, there's no point in wrapping the model
+        # inside a DistributedDataParallel as we'll be under `no_grad` anyways.
+
+        batch_size = dataloader.batch_size
+        logger.info("***** Running %s *****", description)
+        logger.info("  Num examples = %d", self.num_examples(dataloader))
+        logger.info("  Batch size = %d", batch_size)
+        eval_losses: List[float] = []
+        preds: torch.Tensor = None
+        label_ids: torch.Tensor = None
+        model.eval()
+
+        if is_torch_tpu_available():
+            dataloader = pl.ParallelLoader(dataloader, [self.args.device]).per_device_loader(self.args.device)
+
+        if self.args.past_index >= 0:
+            self._past = None
+
+        for inputs in tqdm(dataloader, desc=description):
+
+            inputs_a = {}
+            inputs_b = {}
+
+            for k,v in inputs.items():
+                
+                if k.endswith("_b"):
+                    inputs_b[k[:-2]] = v
+                else:
+                    inputs_a[k] = v
+
+            logits, labels = self.prediction_step(model, inputs_a, prediction_loss_only)
+            
+            if logits is not None:
+                preds = logits if preds is None else torch.cat((preds, logits), dim=0)
+            if labels is not None:
+                label_ids = labels if label_ids is None else torch.cat((label_ids, labels), dim=0)
+
+        if self.args.past_index and hasattr(self, "_past"):
+            # Clean the state at the end of the evaluation loop
+            delattr(self, "_past")
+
+        if self.args.local_rank != -1:
+            # In distributed mode, concatenate all results from all nodes:
+            if preds is not None:
+                preds = self.distributed_concat(preds, num_total_examples=self.num_examples(dataloader))
+            if label_ids is not None:
+                label_ids = self.distributed_concat(label_ids, num_total_examples=self.num_examples(dataloader))
+        elif is_torch_tpu_available():
+            # tpu-comment: Get all predictions and labels from all worker shards of eval dataset
+            if preds is not None:
+                preds = xm.mesh_reduce("eval_preds", preds, torch.cat)
+            if label_ids is not None:
+                label_ids = xm.mesh_reduce("eval_label_ids", label_ids, torch.cat)
+
+        # Finally, turn the aggregated tensors into numpy arrays.
+        if preds is not None:
+            preds = preds.cpu().numpy()
+        if label_ids is not None:
+            label_ids = label_ids.cpu().numpy()
+
+        metrics = {}
+        for key in list(metrics.keys()):
+            if not key.startswith("eval_"):
+                metrics[f"eval_{key}"] = metrics.pop(key)
+
+        return PredictionOutput(predictions=preds, label_ids=label_ids, metrics=metrics)
+
+
     def distributed_concat(self, tensor: torch.Tensor, num_total_examples: int) -> torch.Tensor:
         assert self.args.local_rank != -1
 
@@ -1317,25 +1615,17 @@ class Trainer:
             Tuple[Optional[float], Optional[torch.Tensor], Optional[torch.Tensor]]:
             A tuple with the loss, logits and labels (each being optional).
         """
-        has_labels = any(inputs.get(k) is not None for k in ["labels", "lm_labels", "masked_lm_labels"])
+        
 
         inputs = self._prepare_inputs(inputs, model)
 
         with torch.no_grad():
             outputs = model(**inputs)
-            if has_labels:
-                loss, logits = outputs[:2]
-                loss = loss.mean().item()
-            else:
-                loss = None
-                logits = outputs[0]
-            if self.args.past_index >= 0:
-                self._past = outputs[self.args.past_index if has_labels else self.args.past_index - 1]
+            
 
-        if prediction_loss_only:
-            return (loss, None, None)
-
+        
         labels = inputs.get("labels")
-        if labels is not None:
-            labels = labels.detach()
-        return (loss, logits.detach(), labels)
+        doc_ids = inputs.get("doc_id")
+        
+        return outputs, labels
+
