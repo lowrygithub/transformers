@@ -1,0 +1,15 @@
+{
+    "model_name_or_path": "bert-base-multilingual-cased",
+    "model_name_or_path_b": "bert-base-multilingual-cased",
+    "task_name": "DSSM",
+    "do_train": true,
+    "data_dir": "/multimedia-nfs/kerli/VideoSpaceV/Data/Hrs/full/",
+    "max_seq_length": 256,  
+    "per_device_train_batch_size": 128,
+    "learning_rate": 2e-5,  
+    "num_train_epochs": 16,
+    "save_steps":5000,
+    "output_dir": "/multimedia-nfs/kerli/VideoSpaceV/Model/Hrs/full/bce_bs128/",
+    "overwrite_output_dir": true,
+    "loss_function": "bce"
+}
